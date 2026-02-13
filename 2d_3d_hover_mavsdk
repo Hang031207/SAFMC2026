@@ -1,0 +1,211 @@
+#!/usr/bin/env python3
+import asyncio
+from mavsdk import System
+from mavsdk.offboard import PositionNedYaw, OffboardError
+
+USE_GZ = False
+
+# ===== EDIT HERE =====
+if USE_GZ:
+    DRONE_PORTS = [14581, 14582, 14583]   # sim
+else:
+    DRONE_PORTS = [14572, 14590]   # real drones
+
+HOVER_ALT = -0.7 #m
+OFFBOARD_RATE = 10 #Hz
+ARM_DELAY = 3 # Delay between retry attempts
+ARM_RETRY = 5
+MISSION_DURATION = 30 #seconds
+# =====================
+
+# --------------------------------------------------
+async def wait_until_ready(drone, name):
+    print(f"[{name}] Waiting for full armable state...")
+
+    async for health in drone.telemetry.health():
+        print(
+            f"[{name}] health | "
+            f"local:{health.is_local_position_ok} "
+            f"armable:{health.is_armable}"
+        )
+
+        if (
+            health.is_local_position_ok
+            and health.is_armable
+        ):
+            print(f"[{name}] READY TO ARM")
+            break
+
+        await asyncio.sleep(1)
+
+
+# --------------------------------------------------
+async def connect_drone(port, idx):
+    drone = System(port=50051 + idx)
+
+    await drone.connect(system_address=f"udp://:{port}")
+    print(f"[Drone {port}] Connecting...")
+
+    async for state in drone.core.connection_state():
+        if state.is_connected:
+            print(f"[Drone {port}] Connected")
+            break
+
+    await wait_until_ready(drone, f"Drone{idx+1}")
+    return drone
+
+
+# --------------------------------------------------
+async def arm_with_retry(drone, name):
+    for attempt in range(ARM_RETRY):
+        try:
+            print(f"[{name}] Arming attempt {attempt+1}")
+            await drone.action.arm()
+            print(f"[{name}] Armed")
+            return True
+        except Exception as e:
+            print(f"[{name}] Arm failed:", e)
+            await asyncio.sleep(2)
+
+    print(f"[{name}] ARM FAILED after {ARM_RETRY} retries")
+    return False
+
+
+# --------------------------------------------------
+async def prepare_offboard(drone, name):
+    print(f"[{name}] Sending pre-offboard setpoints...")
+
+    for _ in range(40):
+        await drone.offboard.set_position_ned(
+            PositionNedYaw(0.0, 0.0, 0.0, 0.0)
+        )
+        await asyncio.sleep(0.05)
+
+
+# --------------------------------------------------
+async def start_hover(drone, name):
+    if not await arm_with_retry(drone, name):
+        return None
+
+    print(f"[{name}] Getting current position...")
+    async for pv in drone.telemetry.position_velocity_ned():
+        pos = pv.position
+        print(f"[{name}] N={pos.north_m:.2f} E={pos.east_m:.2f} D={pos.down_m:.2f}")
+
+        hover_wp = PositionNedYaw(
+            pos.north_m,
+            pos.east_m,
+            pos.down_m + HOVER_ALT,
+            0.0,
+        )
+        break
+
+    await prepare_offboard(drone, name)
+
+    print(f"[{name}] Starting offboard...")
+    await drone.offboard.set_position_ned(hover_wp)
+
+    try:
+        await drone.offboard.start()
+    except OffboardError as e:
+        print(f"[{name}] Offboard start failed:", e)
+        await drone.action.disarm()
+        return None
+
+    return hover_wp
+
+
+# --------------------------------------------------
+async def hover_loop(drone, name, wp):
+    dt = 1.0 / OFFBOARD_RATE
+    print(f"[{name}] Hovering...")
+
+    try:
+        while True:
+            await drone.offboard.set_position_ned(wp)
+            await asyncio.sleep(dt)
+    except asyncio.CancelledError:
+        print(f"[{name}] Hover stopped")
+
+# --------------------------------------------------
+async def land_drone(drone, name):
+    """Land a single drone"""
+    print(f"[{name}] Landing...")
+    try:
+        await drone.offboard.stop()
+    except:
+        pass
+    await drone.action.land()
+
+# --------------------------------------------------
+async def run():
+    print("\n=== MULTI-DRONE HOVER ===\n")
+
+    # Connect all drones concurrently
+    print("Connecting to all drones...\n")
+    drones = await asyncio.gather(
+        *[connect_drone(port, i) for i, port in enumerate(DRONE_PORTS)]
+    )
+    print("\nAll drones connected\n")
+
+    # CRITICAL: Let MAVLink streams stabilize
+    print("Waiting 5 seconds for MAVLink streams to stabilize...\n")
+    await asyncio.sleep(5)
+
+    # Start hover for all drones SEQUENTIALLY
+    print("Arming and starting offboard mode...\n")
+    hover_wps = []
+    for i in range(len(drones)):
+        print(f"--- Processing Drone {i+1} ---")
+        wp = await start_hover(drones[i], f"Drone{i+1}")
+
+        if wp is None:
+            print(f"\nâœ— Drone {i+1} failed to start - aborting\n")
+            return
+
+        hover_wps.append(wp)
+
+    # Spacing between drones to reduce radio congestion
+    if i < len(drones) - 1:
+        print(f"Waiting 3 seconds before next drone...\n")
+        await asyncio.sleep(3)
+
+    print("\nâœ“ All drones hovering\n")
+
+    # Start hover loops for all drones concurrently
+    hover_tasks = [
+        asyncio.create_task(hover_loop(drones[i], f"Drone{i+1}", hover_wps[i]))
+        for i in range(len(drones))
+    ]
+
+    # ===== MISSION WITH TRY-EXCEPT-FINALLY =====
+    try:
+        print(f"=== MISSION START: Hovering for {MISSION_DURATION}s ===\n")
+        await asyncio.sleep(MISSION_DURATION)
+        print("\n=== MISSION COMPLETE ===\n")
+
+    except KeyboardInterrupt:
+        print("\n\n Mission interrupted by user (Ctrl+C)\n")
+
+    finally:
+        print("Cleaning up...\n")
+
+        # Cancel all hover tasks
+        for task in hover_tasks:
+            task.cancel()
+        await asyncio.gather(*hover_tasks, return_exceptions=True)
+
+        # Land all drones concurrently
+        print("Landing all drones...\n")
+        await asyncio.gather(
+            *[land_drone(drones[i], f"Drone{i+1}") for i in range(len(drones))],
+            return_exceptions=True  # Don't let one failure stop others from landing
+        )
+
+        print("\n All drones landed\n")
+
+    print("=== DONE ===\n")
+
+
+if __name__ == "__main__":
+    asyncio.run(run())
