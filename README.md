@@ -39,15 +39,6 @@ Key technical focuses include:
 
 # System Architecture
 
-The system consists of several major components:
-
-Mission Planning  
-↓  
-Trajectory Generation  
-↓  
-Autonomous Navigation  
-↓  
-Drone Control (MAVSDK / PX4)
 
 
 Main Modules
@@ -61,8 +52,8 @@ Artificial Potential Field (APF)
 - Handles drone–drone interaction and environmental constraints
 
 Multi-Drone Coordination
-- Leader–follower or coordinated flock strategies
-- Maintains safe spacing between drones
+- Leader–follower (breadcrumb trail trajectory)
+- Communicates in MAVLink Messages through WiFi Router
 
 Low-Level Flight Control
 - Implemented through PX4 and MAVSDK
